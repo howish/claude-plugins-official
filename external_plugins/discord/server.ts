@@ -25,6 +25,10 @@ import {
   ButtonBuilder,
   ButtonStyle,
   ActionRowBuilder,
+  SlashCommandBuilder,
+  REST,
+  Routes,
+  MessageFlags,
   type Message,
   type Attachment,
   type Interaction,
@@ -33,6 +37,7 @@ import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
 import { join, sep } from 'path'
+import { spawn } from 'child_process'
 
 const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -819,6 +824,69 @@ client.on('error', err => {
   process.stderr.write(`discord channel: client error: ${err}\n`)
 })
 
+// ---------------------------------------------------------------------------
+// Slash commands (Discord-side `/foo`) for operating the host Claude Code
+// instance remotely.
+//
+// `/reload` ➜ types Claude Code's native `/reload-plugins` into the host tmux
+//   pane. Reloads plugins/skills/agents/hooks/plugin-MCP servers without
+//   killing the session.
+//
+// Auth mirrors the button-click path: access.allowFrom whitelist only.
+// Architecture: spawn() with detached:true + unref + stdio:'ignore' so the
+// tmux send-keys survives this plugin process being killed (e.g. if CC was
+// somehow restarted between the interaction reply and the keys landing).
+// ---------------------------------------------------------------------------
+
+const TMUX_TARGET = process.env.CLAUDE_TMUX_TARGET ?? 'claude_main'
+
+const SLASH_COMMANDS = [
+  new SlashCommandBuilder()
+    .setName('reload')
+    .setDescription('Reload plugins/skills/agents/hooks/MCP servers via /reload-plugins (no restart)')
+    .toJSON(),
+]
+
+function triggerReloadPlugins(): void {
+  // Type `/reload-plugins<Enter>` into the host tmux pane. CC's slash command
+  // resolver handles the rest. Lightweight — no kill/respawn, current session
+  // continues uninterrupted, MCP/skill/agent registries refresh in place.
+  const cmd = `sleep 0.3 ; tmux send-keys -t ${TMUX_TARGET} '/reload-plugins' Enter`
+  const proc = spawn('bash', ['-c', cmd], {
+    detached: true,
+    stdio: 'ignore',
+  })
+  proc.unref()
+}
+
+client.on('interactionCreate', async (interaction: Interaction) => {
+  if (!interaction.isChatInputCommand()) return
+
+  const access = loadAccess()
+  if (!access.allowFrom.includes(interaction.user.id)) {
+    await interaction.reply({
+      content: 'Not authorized.',
+      flags: MessageFlags.Ephemeral,
+    }).catch(() => {})
+    return
+  }
+
+  if (interaction.commandName === 'reload') {
+    await interaction.reply({
+      content:
+        '♻️ Triggering /reload-plugins in tmux pane ' + TMUX_TARGET + '\n' +
+        'Session continues, registries refresh in place.',
+    }).catch(() => {})
+    triggerReloadPlugins()
+    return
+  }
+
+  await interaction.reply({
+    content: `Unknown slash command: /${interaction.commandName}`,
+    flags: MessageFlags.Ephemeral,
+  }).catch(() => {})
+})
+
 // Button-click handler for permission requests. customId is
 // `perm:allow:<id>`, `perm:deny:<id>`, or `perm:more:<id>`.
 // Security mirrors the text-reply path: allowFrom must contain the sender.
@@ -968,8 +1036,47 @@ async function handleInbound(msg: Message): Promise<void> {
   })
 }
 
-client.once('ready', c => {
+client.once('ready', async c => {
   process.stderr.write(`discord channel: gateway connected as ${c.user.tag}\n`)
+
+  // Register slash commands. We try per-guild first (instant propagation), then
+  // fall back to global (~1h propagation but no guild list needed).
+  //
+  // Prereq: the bot must have been invited with `applications.commands` scope
+  // in addition to `bot`. If registration succeeds but commands don't appear
+  // in Discord, that's the most likely cause — re-invite via the Developer
+  // Portal OAuth2 URL Generator with both scopes ticked.
+  const appId = c.application?.id ?? c.user.id
+  const rest = new REST({ version: '10' }).setToken(TOKEN)
+  const guildIds = c.guilds.cache.map(g => g.id)
+  const cmdNames = SLASH_COMMANDS.map(c => c.name).join(', ')
+  process.stderr.write(`discord channel: registering slash commands [${cmdNames}] as appId=${appId}\n`)
+
+  if (guildIds.length === 0) {
+    // No guilds (DM-only bot) → register globally
+    try {
+      await rest.put(
+        Routes.applicationCommands(appId),
+        { body: SLASH_COMMANDS },
+      )
+      process.stderr.write(`discord channel: slash commands registered GLOBALLY (~1h propagation)\n`)
+    } catch (err) {
+      process.stderr.write(`discord channel: GLOBAL slash command registration failed: ${err}\n`)
+    }
+    return
+  }
+
+  for (const guildId of guildIds) {
+    try {
+      await rest.put(
+        Routes.applicationGuildCommands(appId, guildId),
+        { body: SLASH_COMMANDS },
+      )
+      process.stderr.write(`discord channel: slash commands registered in guild ${guildId}\n`)
+    } catch (err) {
+      process.stderr.write(`discord channel: slash command registration failed for guild ${guildId}: ${err}\n`)
+    }
+  }
 })
 
 client.login(TOKEN).catch(err => {
