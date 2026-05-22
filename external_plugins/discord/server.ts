@@ -460,7 +460,7 @@ const mcp = new Server(
     instructions: [
       'The sender reads Discord, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
-      'Messages from Discord arrive as <channel source="discord" chat_id="..." message_id="..." user="..." ts="...">. If the tag has attachment_count, the attachments attribute lists name/type/size — call download_attachment(chat_id, message_id) to fetch them. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
+      'Messages from Discord arrive as <channel source="discord" chat_id="..." message_id="..." user="..." ts="..." channel_name="..." guild_name="..." [reply_to_id="..."]>. channel_name/guild_name help distinguish topic channels at a glance; reply_to_id is set only when the inbound message itself quote-replies to an earlier message (call fetch_messages with that id if the referenced context isn\'t obvious from conversation). If the tag has attachment_count, the attachments attribute lists name/type/size — call download_attachment(chat_id, message_id) to fetch them. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
       '',
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
       '',
@@ -638,6 +638,15 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['chat_id'],
       },
     },
+    {
+      name: 'list_channels',
+      description:
+        "List every Discord channel currently allowlisted for inbound — DMs by user and guild text channels by group. Returns chat_id, channel_name, guild_name, topic (when set), and channel type. Useful when the user references 'the X channel' without an id, or to pick the right channel for an outbound post when more than one is reachable.",
+      inputSchema: {
+        type: 'object',
+        properties: {},
+      },
+    },
   ],
 }))
 
@@ -787,6 +796,56 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             { type: 'text', text: `${arr.length}/50 pins\n${out}` },
           ],
         }
+      }
+      case 'list_channels': {
+        const access = loadAccess()
+        const lines: string[] = []
+
+        // Guild text channels (chat_id = channel snowflake)
+        const guildIds = Object.keys(access.groups)
+        for (const chId of guildIds) {
+          try {
+            const ch = await client.channels.fetch(chId)
+            if (!ch) {
+              lines.push(`[guild?] ${chId} — (channel not found / bot removed)`)
+              continue
+            }
+            const name = 'name' in ch && typeof ch.name === 'string' ? ch.name : '(unnamed)'
+            const guild = 'guild' in ch && ch.guild ? ch.guild.name : '(no guild)'
+            const topic = 'topic' in ch && typeof ch.topic === 'string' && ch.topic ? ch.topic : ''
+            const kind = ChannelType[ch.type] ?? String(ch.type)
+            const policy = access.groups[chId]
+            const mentionFlag = policy?.requireMention ? ' [@-only]' : ''
+            const topicPart = topic ? ` — topic: ${topic.slice(0, 80)}` : ''
+            lines.push(`[${kind}] ${chId}  #${name}  (guild: ${guild})${mentionFlag}${topicPart}`)
+          } catch (err) {
+            const m = err instanceof Error ? err.message : String(err)
+            lines.push(`[guild?] ${chId} — fetch failed: ${m}`)
+          }
+        }
+
+        // DM-allowed users (chat_id = DM channel snowflake, only known once a DM exists)
+        for (const userId of access.allowFrom) {
+          try {
+            const user = await client.users.fetch(userId)
+            // We avoid createDM() here to keep this read-only; the DM channel id
+            // becomes visible only after the first inbound DM from that user
+            // (recorded in dmChannelUsers). Iterate that reverse-map to surface it.
+            let dmChId: string | undefined
+            for (const [chId, uid] of dmChannelUsers.entries()) {
+              if (uid === userId) { dmChId = chId; break }
+            }
+            const dmIdPart = dmChId ? dmChId : '(no dm channel yet)'
+            lines.push(`[DM] ${dmIdPart}  @${user.username}  (user_id: ${userId})`)
+          } catch (err) {
+            const m = err instanceof Error ? err.message : String(err)
+            lines.push(`[DM] (?)  user_id: ${userId} — fetch failed: ${m}`)
+          }
+        }
+
+        const header = `${guildIds.length} guild channel(s), ${access.allowFrom.length} DM user(s)`
+        const body = lines.length > 0 ? lines.join('\n') : '(no allowlisted channels)'
+        return { content: [{ type: 'text', text: `${header}\n${body}` }] }
       }
       default:
         return {
@@ -1018,6 +1077,24 @@ async function handleInbound(msg: Message): Promise<void> {
   // forgeable by any allowlisted sender typing that string.
   const content = msg.content || (atts.length > 0 ? '(attachment)' : '')
 
+  // Channel + guild context: lets Claude distinguish topic channels without
+  // an extra lookup. Discord caps channel names at 100 chars and guild names
+  // at 100 chars; both are sanitized for the meta block (XML-attribute friendly).
+  const channel_name: string | undefined = (() => {
+    if (msg.channel.type === ChannelType.DM) return 'DM'
+    if ('name' in msg.channel && typeof msg.channel.name === 'string') {
+      return msg.channel.name
+    }
+    return undefined
+  })()
+  const guild_name: string | undefined = msg.guild?.name
+
+  // Reply context: only set when the inbound message is itself a quote-reply.
+  // Zero-overhead for normal messages — the attribute is omitted entirely.
+  // Snippet is intentionally NOT included to keep this cheap; Claude can
+  // call fetch_messages or react with reply_to when the id alone is enough.
+  const reply_to_id: string | undefined = msg.reference?.messageId ?? undefined
+
   mcp.notification({
     method: 'notifications/claude/channel',
     params: {
@@ -1028,6 +1105,9 @@ async function handleInbound(msg: Message): Promise<void> {
         user: msg.author.username,
         user_id: msg.author.id,
         ts: msg.createdAt.toISOString(),
+        ...(channel_name ? { channel_name } : {}),
+        ...(guild_name ? { guild_name } : {}),
+        ...(reply_to_id ? { reply_to_id } : {}),
         ...(atts.length > 0 ? { attachment_count: String(atts.length), attachments: atts.join('; ') } : {}),
       },
     },
