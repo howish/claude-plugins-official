@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""Restore the local discord-plugin patch after a plugin update or container reset.
+
+The discord channel must be a `plugin:` channel — a `server:` channel is only
+loadable via --dangerously-load-development-channels, which prompts a
+confirmation dialog on every launch. Being a plugin means running out of
+~/.claude/plugins/cache/, which `claude plugin install/update` overwrites with
+stock upstream. Stock is missing this fork's work:
+
+    list_channels / pin_message / unpin_message / list_pinned
+    channel_name + guild_name on inbound messages
+    /reload
+    the commented-out 'claude/channel/permission' capability (otherwise every
+    tool call DM-floods the user with Allow/Deny prompts)
+
+So the patch has to be re-applied, and nobody reliably remembers to. This runs
+from a SessionStart hook.
+
+Version safety: only restores when the installed plugin is the SAME version the
+fork is based on. If upstream has moved on, overwriting would silently revert
+their fixes to April-era code — so it refuses and says so instead.
+
+Always exits 0; a broken self-heal must never block a session.
+"""
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+PLUGIN_ID = "discord@claude-plugins-official"
+REL_SOURCE = "external_plugins/discord/server.ts"
+# Markers that prove the patched file is in place, not stock upstream.
+MARKERS = ("list_channels", "// 'claude/channel/permission': {},")
+
+LOG = Path.home() / ".claude" / "state" / "discord-plugin-sync.log"
+
+
+def log(msg: str) -> None:
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    line = f"{stamp} {msg}"
+    try:
+        LOG.parent.mkdir(parents=True, exist_ok=True)
+        with LOG.open("a") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
+    print(f"discord-plugin-sync: {msg}", file=sys.stderr)
+
+
+def plugin_version(plugin_dir: Path) -> str | None:
+    manifest = plugin_dir / ".claude-plugin" / "plugin.json"
+    try:
+        return json.loads(manifest.read_text()).get("version")
+    except (OSError, ValueError):
+        return None
+
+
+def installed_path() -> Path | None:
+    reg = Path.home() / ".claude" / "plugins" / "installed_plugins.json"
+    try:
+        entries = json.loads(reg.read_text())["plugins"].get(PLUGIN_ID)
+    except (OSError, ValueError, KeyError):
+        return None
+    if not entries:
+        return None
+    return Path(entries[0]["installPath"])
+
+
+def main() -> int:
+    # Self-locating: the fork is whatever repo this script lives in.
+    repo = Path(__file__).resolve().parent.parent
+    source = repo / REL_SOURCE
+
+    if not source.is_file():
+        log(f"no patched source at {source} — nothing to sync")
+        return 0
+
+    target_dir = installed_path()
+    if target_dir is None:
+        log(f"{PLUGIN_ID} is not installed — skipping")
+        return 0
+
+    target = target_dir / "server.ts"
+    if not target.is_file():
+        log(f"no server.ts at {target} — skipping")
+        return 0
+
+    src_version = plugin_version(repo / "external_plugins" / "discord")
+    dst_version = plugin_version(target_dir)
+    if src_version != dst_version:
+        log(
+            f"REFUSING to patch: fork is based on {src_version}, installed is "
+            f"{dst_version}. Upstream moved — rebase the fork before syncing, "
+            f"or the update's fixes get reverted."
+        )
+        return 0
+
+    text = target.read_text(errors="replace")
+    if all(m in text for m in MARKERS):
+        return 0  # already patched, stay quiet
+
+    missing = [m for m in MARKERS if m not in text]
+    shutil.copy2(source, target)
+
+    restored = target.read_text(errors="replace")
+    if all(m in restored for m in MARKERS):
+        log(f"re-applied patch to {target} (was missing: {missing})")
+    else:
+        log(f"WARNING: copied to {target} but markers still absent — check by hand")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as exc:  # never block a session
+        log(f"unexpected error: {exc!r}")
+        sys.exit(0)

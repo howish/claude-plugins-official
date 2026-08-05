@@ -454,7 +454,12 @@ const mcp = new Server(
         // gate()/access.allowFrom already drops non-allowlisted senders before
         // handleInbound runs. A server that can't authenticate the replier
         // should NOT declare this.
-        'claude/channel/permission': {},
+        //
+        // — LOCAL PATCH (howish 2026-06-08, re-applied 2026-08-05): disabled.
+        // With this capability declared, CC routes EVERY tool call to Discord DM
+        // for Allow/Deny even when local defaultMode is bypassPermissions,
+        // flooding the user's phone. Same patch as the 0.0.4 plugin cache copy.
+        // 'claude/channel/permission': {},
       },
     },
     instructions: [

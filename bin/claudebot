@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Launch Claude Code with the Discord channel attached.
+#
+# discord is a PLUGIN channel, not a locally configured MCP server. A server:
+# entry has no path through the channel gate except
+# --dangerously-load-development-channels, and that flag shows a confirmation
+# dialog on EVERY launch (the silent branch only fires when channels are
+# disabled / non-firstParty / policy-blocked, none of which apply here). A
+# plugin: entry on Anthropic's default allowlist needs no flag and no dialog —
+# discord@claude-plugins-official is on that list, confirmed by a live inbound
+# message arriving with source="plugin:discord:discord".
+#
+# Two things had to be fixed before this route worked at all:
+#   1. The marketplace was named claude-plugins-official but sourced from
+#      github.com/howish/… — CC reserves that name for anthropics/*, so every
+#      plugin under it failed to load. Re-added from anthropics/.
+#   2. A project-scoped MCP server also named "discord" shadowed the plugin's
+#      own server, so the plugin channel never materialized. Removed.
+#
+# The installed plugin runs THIS repo's patched server.ts, restored on
+# SessionStart by bin/sync-discord-plugin. See that script for what the patch
+# carries and why an update silently reverts it.
+#
+# Invoke by path, not via a shell alias: an alias in an already-running shell
+# holds whatever it read at startup, which is how this broke four times.
+exec claude \
+  --permission-mode bypassPermissions \
+  --channels plugin:discord@claude-plugins-official "$@"
